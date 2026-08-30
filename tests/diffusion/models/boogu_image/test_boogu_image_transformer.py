@@ -246,6 +246,191 @@ def test_transformer_instantiates():
     assert model.x_embedder.out_features == HIDDEN_SIZE
 
 
+def test_final_projection_forward_matches_reference():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        LuminaLayerNormContinuous,
+    )
+
+    layer = LuminaLayerNormContinuous(
+        embedding_dim=HIDDEN_SIZE,
+        conditioning_embedding_dim=32,
+        elementwise_affine=False,
+        out_dim=16,
+        prefix="norm_out",
+    )
+    _randomize_parameters(layer)
+    hidden_states = torch.randn(2, 4, HIDDEN_SIZE)
+    conditioning = torch.randn(2, 32)
+
+    output = layer(hidden_states, conditioning)
+    scale = torch.nn.functional.linear(
+        layer.silu(conditioning),
+        layer.linear_1.weight,
+        layer.linear_1.bias,
+    )
+    normalized = torch.nn.functional.layer_norm(hidden_states, (HIDDEN_SIZE,), eps=1e-5)
+    expected = torch.nn.functional.linear(
+        normalized * (1 + scale[:, None, :]),
+        layer.linear_2.weight,
+        layer.linear_2.bias,
+    )
+
+    torch.testing.assert_close(output, expected)
+
+
+def _expected_quant_aware_prefixes() -> set[str]:
+    prefixes = {"norm_out.linear_1", "norm_out.linear_2"}
+
+    def add_single_stream(prefix: str, *, modulation: bool) -> None:
+        prefixes.update(
+            {
+                f"{prefix}.attn.to_qkv",
+                f"{prefix}.attn.to_out",
+                f"{prefix}.feed_forward.gate_up_proj",
+                f"{prefix}.feed_forward.linear_2",
+            }
+        )
+        if modulation:
+            prefixes.add(f"{prefix}.norm1.linear")
+
+    for stack in ("noise_refiner", "ref_image_refiner"):
+        for index in range(2):
+            add_single_stream(f"{stack}.{index}", modulation=True)
+    for index in range(2):
+        add_single_stream(f"context_refiner.{index}", modulation=False)
+        add_single_stream(f"single_stream_layers.{index}", modulation=True)
+
+    double_stream_suffixes = {
+        "img_instruct_attn.img_to_qkv",
+        "img_instruct_attn.instruct_to_qkv",
+        "img_instruct_attn.instruct_out",
+        "img_instruct_attn.img_out",
+        "img_instruct_attn.to_out",
+        "img_self_attn.to_qkv",
+        "img_self_attn.to_out",
+        "img_feed_forward.gate_up_proj",
+        "img_feed_forward.linear_2",
+        "instruct_feed_forward.gate_up_proj",
+        "instruct_feed_forward.linear_2",
+        "img_norm1.linear",
+        "img_norm2.linear",
+        "img_norm3.linear",
+        "instruct_norm1.linear",
+        "instruct_norm2.linear",
+    }
+    for index in range(2):
+        prefixes.update(f"double_stream_layers.{index}.{suffix}" for suffix in double_stream_suffixes)
+
+    return prefixes
+
+
+def test_transformer_quant_config_targets_supported_boogu_linears():
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    class _RecordingQuantConfig(QuantizationConfig):
+        def __init__(self) -> None:
+            self.prefixes: list[str] = []
+
+        def get_name(self) -> str:
+            return "recording"
+
+        def get_quant_method(self, layer, prefix: str):
+            self.prefixes.append(prefix)
+            return UnquantizedLinearMethod()
+
+        @classmethod
+        def get_supported_act_dtypes(cls):
+            return [torch.float32]
+
+        def get_min_capability(self) -> int:
+            return 0
+
+        @classmethod
+        def from_config(cls, config):
+            return cls()
+
+        def get_config_filenames(self):
+            return []
+
+    quant_config = _RecordingQuantConfig()
+    model = BooguImageTransformer2DModel(
+        od_config=_tiny_od_config(),
+        quant_config=quant_config,
+    )
+    expected = _expected_quant_aware_prefixes()
+
+    assert len(quant_config.prefixes) == len(set(quant_config.prefixes))
+    assert set(quant_config.prefixes) == expected
+
+    configured = {
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, LinearBase) and module.quant_config is quant_config
+    }
+    assert configured == expected
+
+    # Patch/caption/time projections remain ordinary torch linears and do not
+    # receive the vLLM quantization config.
+    assert isinstance(model.x_embedder, torch.nn.Linear)
+    assert isinstance(model.ref_image_patch_embedder, torch.nn.Linear)
+    assert isinstance(model.time_caption_embed.timestep_embedder.linear_1, torch.nn.Linear)
+    assert isinstance(model.time_caption_embed.caption_embedder[1], torch.nn.Linear)
+
+
+def test_transformer_without_quant_config_uses_unquantized_linears():
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    linears = [module for module in model.modules() if isinstance(module, LinearBase)]
+
+    assert linears
+    assert all(module.quant_config is None for module in linears)
+    assert all(isinstance(module.quant_method, UnquantizedLinearMethod) for module in linears)
+
+
+@pytest.mark.parametrize(
+    ("module_name", "expected"),
+    [
+        (
+            "double_stream_layers.0.img_instruct_attn.instruct_to_qkv",
+            ("instruct_to_qkv", ["instruct_to_q", "instruct_to_k", "instruct_to_v"]),
+        ),
+        (
+            "double_stream_layers.0.img_instruct_attn.img_to_qkv",
+            ("img_to_qkv", ["img_to_q", "img_to_k", "img_to_v"]),
+        ),
+        (
+            "single_stream_layers.0.attn.to_qkv",
+            ("to_qkv", ["to_q", "to_k", "to_v"]),
+        ),
+    ],
+)
+def test_transformer_packed_mapping_matches_weight_remapping(module_name, expected):
+    from vllm.model_executor.model_loader.utils import ParamMapping
+
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    assert BooguImageTransformer2DModel.packed_modules_mapping == {
+        "instruct_to_qkv": ["instruct_to_q", "instruct_to_k", "instruct_to_v"],
+        "img_to_qkv": ["img_to_q", "img_to_k", "img_to_v"],
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "gate_up_proj": ["linear_1", "linear_3"],
+    }
+    mapping = ParamMapping(BooguImageTransformer2DModel.packed_modules_mapping)
+    assert mapping.get_sub_modules(module_name) == expected
+
+
 def test_transformer_preprocesses_multiple_instruction_feature_layers():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
